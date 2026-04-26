@@ -32,6 +32,34 @@ logger = logging.getLogger(__name__)
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
+def _warm_up_mlx_thread() -> None:
+    """Replace mlx_lm.generate's generation_stream with one bound to this thread.
+
+    mlx_lm/generate.py creates ``generation_stream`` at import time in the
+    main thread.  All functions inside that module (BatchGenerator.next,
+    next_generated, …) reference it via the module's global dict.  When
+    scheduler.step() runs on the executor thread, any attempt to use
+    ``with mx.stream(generation_stream)`` or ``mx.synchronize(generation_stream)``
+    fails with:
+        RuntimeError: There is no Stream(gpu, 0) in current thread.
+
+    We fix this by creating a new stream *in this executor thread* and
+    writing it into the module's __dict__ so every function in generate.py
+    picks it up automatically.
+
+    NOTE: ``import mlx_lm.generate as X`` resolves to the *generate()
+    function* (not the submodule) because mlx_lm/__init__.py does
+    ``from .generate import generate``, shadowing the submodule name.
+    We must use sys.modules to reach the real module object.
+    """
+    import sys
+    import mlx.core as _mx
+    import mlx_lm.generate  # noqa: F401 – ensure submodule is in sys.modules
+    gen_module = sys.modules["mlx_lm.generate"]
+    new_stream = _mx.new_stream(_mx.default_device())
+    gen_module.__dict__["generation_stream"] = new_stream
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -45,6 +73,9 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mlx-global"
         )
+        # Replace generation_stream with one bound to the executor thread
+        # so that BatchGenerator.next_generated() can use it without error.
+        _global_mlx_executor.submit(_warm_up_mlx_thread).result()
     return _global_mlx_executor
 
 

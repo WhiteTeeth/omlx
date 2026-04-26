@@ -20,16 +20,29 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import sys
 import mlx.core as mx
+import mlx_lm.generate  # noqa: F401 – ensure mlx_lm/generate.py is in sys.modules
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
     PromptProcessingBatch,
     SequenceStateMachine,
-    generation_stream,
 )
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
+
+# ``import mlx_lm.generate as X`` would bind X to the generate() *function*
+# (mlx_lm/__init__.py does ``from .generate import generate``, shadowing the
+# submodule).  Use sys.modules to get the real module object so that all
+# references to generation_stream below always see the live value written by
+# _warm_up_mlx_thread() in engine_core.py.
+_mlx_lm_generate_mod = sys.modules["mlx_lm.generate"]
+
+
+def _generation_stream():
+    """Return the current generation_stream from mlx_lm/generate.py."""
+    return _mlx_lm_generate_mod.generation_stream
 
 from pathlib import Path
 
@@ -37,6 +50,39 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
+
+
+def _safe_synchronize_generation_stream() -> None:
+    """Synchronize generation_stream only if it belongs to the current thread.
+
+    generation_stream is bound to the MLX executor thread.  Calling
+    mx.synchronize() on it from any other thread (e.g. the main thread during
+    engine.close() or scheduler.reset()) raises RuntimeError.  This helper
+    silently skips the sync in that case — safe because GPU work only runs on
+    the executor thread, so there is nothing in-flight to drain elsewhere.
+    """
+    try:
+        mx.synchronize(_generation_stream())
+    except RuntimeError:
+        pass
+
+
+def _close_batch_generator(bg) -> None:
+    """Close a BatchGenerator, suppressing cross-thread stream errors.
+
+    BatchGenerator.close() calls mx.synchronize(generation_stream) to drain
+    in-flight GPU work before releasing Metal wired memory.  If called from a
+    thread other than the MLX executor (e.g. the main thread via engine.close()
+    → scheduler.reset()), the stream is not registered there and raises
+    RuntimeError.  We suppress it — the Metal runtime will clean up when the
+    process exits or GC finalizes.
+    """
+    if bg is None:
+        return
+    try:
+        bg.close()
+    except RuntimeError:
+        pass
 
 
 def _sync_and_clear_cache():
@@ -50,7 +96,7 @@ def _sync_and_clear_cache():
 
     See: https://github.com/jundot/omlx/issues/300
     """
-    mx.synchronize(generation_stream)
+    _safe_synchronize_generation_stream()
     mx.synchronize()  # default stream
     mx.clear_cache()
 
@@ -1776,9 +1822,11 @@ class Scheduler:
 
         try:
             # Synchronize pending generation_stream operations before
-            # accessing batch cache tensors.
-            mx.synchronize(generation_stream)
-            with mx.stream(generation_stream):
+            # accessing batch cache tensors.  Use the safe variant to
+            # silently skip sync when called from a thread that doesn't
+            # own the stream (e.g. in unit tests running on the main thread).
+            _safe_synchronize_generation_stream()
+            with mx.stream(_generation_stream()):
                 result = self.batch_generator.extract_cache([uid])
                 if uid not in result:
                     return None
@@ -2685,7 +2733,7 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
-            mx.synchronize(generation_stream)
+            _safe_synchronize_generation_stream()
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
@@ -2792,6 +2840,7 @@ class Scheduler:
                 req.prompt_cache = None
         self.waiting.clear()
         # Reset batch generator only (cache is not corrupted)
+        _close_batch_generator(self.batch_generator)
         self.batch_generator = None
         self._current_sampler_params = None
         # Reclaim fragmented Metal buffers after generation failure.
@@ -3417,7 +3466,7 @@ class Scheduler:
         # store_cache -> mx.save_safetensors triggers implicit mx.eval() which
         # can conflict with async Metal operations on the generation stream.
         if finished_ids:
-            mx.synchronize(generation_stream)
+            _safe_synchronize_generation_stream()
 
         # SpecPrefill: restore original RoPE if active request finished
         for rid in finished_ids:
@@ -3457,7 +3506,7 @@ class Scheduler:
                             # Keep all tensor-touching cache store work on the
                             # generation stream to avoid cross-stream conflicts
                             # with arrays extracted from BatchGenerator caches.
-                            with mx.stream(generation_stream):
+                            with mx.stream(_generation_stream()):
                                 boundary_override = self._get_boundary_store_override(
                                     request_id,
                                     cacheable_sequence,
@@ -3549,7 +3598,7 @@ class Scheduler:
                 # batch_generator.next() call.  Without this barrier the Metal
                 # driver can hit 'completeMemory() prepare count underflow'.
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
-                mx.synchronize(generation_stream)
+                _safe_synchronize_generation_stream()
                 self._remove_uid_from_active_batch(uid)
                 if hasattr(self.model, "unregister_rope_delta"):
                     self.model.unregister_rope_delta(uid)
@@ -3612,6 +3661,7 @@ class Scheduler:
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Clear batch generator (this is the source of the corruption)
+        _close_batch_generator(self.batch_generator)
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
@@ -3756,6 +3806,7 @@ class Scheduler:
             # BatchGenerator is in an inconsistent state (partial
             # prefill), so reset it entirely. Pending aborts will
             # be processed at the start of the next step().
+            _close_batch_generator(self.batch_generator)
             self.batch_generator = None
             self._current_sampler_params = None
             self._boundary_cache_snapshots.clear()
@@ -3876,6 +3927,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        _close_batch_generator(self.batch_generator)
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
