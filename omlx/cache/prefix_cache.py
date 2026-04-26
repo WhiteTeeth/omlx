@@ -1963,9 +1963,10 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Cache types that don't support block slicing (have different shapes)
         # ArraysCache: generic array cache used by some hybrid models (e.g., Qwen3-Next)
+        # SizedArraysCache: wrapper around ArraysCache stored in SSD metadata with this name
         # RotatingKVCache: uses circular buffer with fixed max_size, cannot be sliced
         # CacheList: composite cache with List[Tuple] format, not (keys, values) tuple
-        non_sliceable_types = {'ArraysCache', 'RotatingKVCache', 'CacheList'}
+        non_sliceable_types = {'ArraysCache', 'SizedArraysCache', 'RotatingKVCache', 'CacheList'}
 
         expected_seq_len = None
 
